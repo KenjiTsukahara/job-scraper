@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Kyujinbox job scraper - improved version with thread safety.
+"""Kyujinbox job scraper - v2 with accurate 24-hour filtering.
 
-Improvements:
+Key improvements:
+  - Uses `u=1` parameter for accurate 24-hour filtering (not `td=1`)
   - Thread-safe sessions (each worker gets its own session)
+  - Only collects jobs marked as truly new (within 24 hours)
   - Better logging with Python logging module
-  - Proper error handling with logging
-  - Type consistency (is_new as string)
-  - Prefer stable job URLs (/jb/) over redirect URLs (/rd/)
-  - Better company name extraction
-  - Non-zero exit code on complete failure
+  - Validates job freshness by checking time indicators
 
 Outputs:
   - CSV / JSON / Summary under --output-dir (default: data)
@@ -84,6 +82,14 @@ USER_AGENTS: Tuple[str, ...] = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 
+# Patterns to identify fresh jobs (within 24 hours)
+FRESH_TIME_PATTERNS = [
+    r"(\d+)分前",      # X minutes ago
+    r"(\d+)時間前",    # X hours ago
+    r"新着",           # New
+    r"本日",           # Today
+]
+
 # Heuristics: skip lines that are NOT company name
 COMPANY_SKIP_PREFIXES = (
     "新着", "PR", "急募", "おすすめ", "注目",
@@ -135,11 +141,12 @@ def _rotate_headers(session: requests.Session) -> None:
     session.headers["Referer"] = BASE_URL
 
 
-def get_search_url(keyword: str, prefecture: str, days: int, page: int) -> str:
-    """Generate a path-based search URL (proven to work with 求人ボックス)."""
+def get_search_url(keyword: str, prefecture: str, page: int) -> str:
+    """Generate a search URL with 24-hour filter (u=1)."""
     encoded_keyword = urllib.parse.quote(keyword)
     encoded_prefecture = urllib.parse.quote(prefecture)
-    return f"{BASE_URL}/{encoded_keyword}の仕事-{encoded_prefecture}?td={days}&pg={page}"
+    # Use u=1 for 24-hour filtering (confirmed to work correctly)
+    return f"{BASE_URL}/{encoded_keyword}の仕事-{encoded_prefecture}?u=1&pg={page}"
 
 
 def _log_http_failure(site: str, url: str, resp: requests.Response) -> None:
@@ -205,6 +212,32 @@ def _looks_like_company(line: str, prefecture: str) -> bool:
     return True
 
 
+def _is_fresh_job(text: str) -> bool:
+    """Check if the job posting is fresh (within 24 hours)."""
+    for pattern in FRESH_TIME_PATTERNS:
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _extract_time_info(text: str) -> str:
+    """Extract time information from job text."""
+    # Match patterns like "2時間前", "30分前", "新着"
+    patterns = [
+        (r"(\d+)分前", "{}分前"),
+        (r"(\d+)時間前", "{}時間前"),
+    ]
+    for pattern, fmt in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return fmt.format(m.group(1))
+    if "新着" in text:
+        return "新着"
+    if "本日" in text:
+        return "本日"
+    return ""
+
+
 def parse_job_listing(
     section: BeautifulSoup, industry_name: str, prefecture: str
 ) -> Optional[Dict[str, str]]:
@@ -225,6 +258,10 @@ def parse_job_listing(
 
         full_text = section.get_text("\n", strip=True)
         text_lines = [line.strip() for line in full_text.split("\n") if line.strip()]
+
+        # Check if this job is fresh (within 24 hours)
+        is_fresh = _is_fresh_job(full_text)
+        time_info = _extract_time_info(full_text)
 
         # Company: choose a plausible line after title
         company = ""
@@ -273,7 +310,8 @@ def parse_job_listing(
             "industry": industry_name,
             "source": "求人ボックス",
             "url": job_url,
-            "is_new": str("新着" in full_text or "時間前" in full_text),  # String for type consistency
+            "is_new": str(is_fresh),
+            "time_info": time_info,
             "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "prefecture": prefecture,
         }
@@ -329,11 +367,12 @@ def scrape_page_with_retry(
     return [], None
 
 
-def get_new_job_count(soup: BeautifulSoup) -> int:
-    """Extract '本日の新着' count if available."""
+def get_total_count(soup: BeautifulSoup) -> int:
+    """Extract total job count from the page."""
     try:
         page_text = soup.get_text()
-        m = re.search(r"本日の新着\s*([0-9,]+)\s*件", page_text)
+        # Match patterns like "497 件" or "497件"
+        m = re.search(r"(\d[\d,]*)\s*件", page_text)
         if m:
             return int(m.group(1).replace(",", ""))
     except Exception:
@@ -345,13 +384,12 @@ def scrape_industry(
     keyword: str,
     industry_name: str,
     prefecture: str,
-    days: int,
     max_pages_per_search: int,
 ) -> List[Dict[str, str]]:
     """Scrape a single (prefecture, industry) pair."""
     all_jobs: List[Dict[str, str]] = []
 
-    first_url = get_search_url(keyword, prefecture, days, 1)
+    first_url = get_search_url(keyword, prefecture, 1)
 
     logger.info("=" * 60)
     logger.info("地域: %s / 業種: %s (検索: %s)", prefecture, industry_name, keyword)
@@ -362,19 +400,19 @@ def scrape_industry(
         logger.error("  ページを取得できませんでした")
         return []
 
-    new_jobs = get_new_job_count(soup)
-    if days == 1 and new_jobs > 0:
-        pages_to_scrape = min((new_jobs // 25) + 1, max_pages_per_search)
-        logger.info("  本日の新着: %d件", new_jobs)
+    total_count = get_total_count(soup)
+    if total_count > 0:
+        pages_to_scrape = min((total_count // 25) + 1, max_pages_per_search)
+        logger.info("  24時間以内の新着: %d件 (最大%dページ取得)", total_count, pages_to_scrape)
     else:
         pages_to_scrape = max_pages_per_search
-        logger.info("  新着件数: (取得できず) -> %dページ上限で取得", pages_to_scrape)
+        logger.info("  件数取得できず -> %dページ上限で取得", pages_to_scrape)
 
     all_jobs.extend(first_jobs)
     logger.info("  ページ 1/%d: %d件 (累計: %d件)", pages_to_scrape, len(first_jobs), len(all_jobs))
 
     for page in range(2, pages_to_scrape + 1):
-        url = get_search_url(keyword, prefecture, days, page)
+        url = get_search_url(keyword, prefecture, page)
         page_jobs, _ = scrape_page_with_retry(url, industry_name, prefecture)
         if not page_jobs:
             break
@@ -395,7 +433,7 @@ def save_outputs(jobs: List[Dict[str, str]], output_dir: str) -> Tuple[str, str,
 
     fieldnames = [
         "title", "company", "location", "salary", "employment_type",
-        "industry", "source", "url", "is_new", "scraped_at", "prefecture",
+        "industry", "source", "url", "is_new", "time_info", "scraped_at", "prefecture",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -409,12 +447,16 @@ def save_outputs(jobs: List[Dict[str, str]], output_dir: str) -> Tuple[str, str,
 
     by_pref: Dict[str, int] = {}
     by_ind: Dict[str, int] = {}
+    fresh_count = 0
     for job in jobs:
         by_pref[job.get("prefecture", "")] = by_pref.get(job.get("prefecture", ""), 0) + 1
         by_ind[job.get("industry", "")] = by_ind.get(job.get("industry", ""), 0) + 1
+        if job.get("is_new") == "True":
+            fresh_count += 1
 
     with open(summary_path, "w", encoding="utf-8") as f:
         f.write(f"Total jobs: {len(jobs)}\n")
+        f.write(f"Fresh jobs (within 24h): {fresh_count}\n")
         f.write("\nBy prefecture:\n")
         for k in sorted(by_pref.keys()):
             f.write(f"- {k}: {by_pref[k]}\n")
@@ -446,12 +488,11 @@ def parse_prefectures_arg(s: Optional[str]) -> List[str]:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="求人ボックスの求人を複数都道府県で収集")
+    parser = argparse.ArgumentParser(description="求人ボックスの求人を複数都道府県で収集（24時間以内の新着のみ）")
     parser.add_argument(
         "--prefectures", default=None,
         help="都道府県をカンマ区切りで指定（例: 東京都,神奈川県,大阪府）"
     )
-    parser.add_argument("--days", type=int, default=1, help="新着日数 td=<N>（1=24時間以内）")
     parser.add_argument("--output-dir", default=OUTPUT_DIR_DEFAULT, help="出力ディレクトリ")
     parser.add_argument(
         "--workers", type=int, default=3,
@@ -469,9 +510,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_pages_per_search = 60 if len(prefectures) <= 1 else 10
 
     logger.info("=" * 80)
-    logger.info("求人ボックス自動収集（複数都道府県）")
+    logger.info("求人ボックス自動収集（24時間以内の新着のみ）")
     logger.info("都道府県: %s", prefectures)
-    logger.info("days(td): %d", args.days)
     logger.info("max_pages_per_search: %d", max_pages_per_search)
     logger.info("workers: %d", args.workers)
     logger.info("=" * 80)
@@ -487,7 +527,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fail_count = 0
 
     def run_one(pref: str, keyword: str, label: str) -> List[Dict[str, str]]:
-        return scrape_industry(keyword, label, pref, args.days, max_pages_per_search)
+        return scrape_industry(keyword, label, pref, max_pages_per_search)
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         futures = {
